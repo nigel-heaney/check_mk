@@ -1,0 +1,256 @@
+#!/bin/bash
+#  check_mk_yum: Local plugin for check_mk_agent and will parse yum errata information so alerts can be raised for 
+#                for missing patches (Critical/Moderate). RHEL5 system cannot report this information and will only 
+#                report missing security patches.
+#
+#                Due to the slow nature of yum checks and updating caches we should set this up to not run every 2 minutes!
+#
+#   Version      Author          Date        Description
+#     0.1        Nigel Heaney    12-07-2016  Initial version
+
+
+
+YUM=/usr/bin/yum
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+ALERTLEVEL=$WARNING                                     #Set this to whatever we want when a critical/important update is detected.
+IMPORTANTLEVEL=9                                        #defines how many important updates are missing before it triggers an alert. 
+CRITICALLEVEL=0                                         #How many critical updates before it will alert
+CHECKNAME="Yum"
+PERFDATA="-"                                            #We wont be maintaining perfdata...for now
+INSTALL_SECURITY_PLUGIN=1				#Auto install yum security plugin if missing
+YUMCLEAN=1                                              #perform a yum clean after lookup.
+#BLACKLIST="--exclude=kernel*"	                        #list packges to be excluded from updates
+BLACKLIST=""
+OPTIONS='--disableplugin=fastestmirror'			#Setup any options here, disabling fastestmirror speeds up the check considerably.
+TIMEOUTVAL=60
+RELEASE=0
+
+get_version () 
+{
+    #query release files to obtain OS release, rhel5 functions differently and requires different command to be executed.
+    if [ -e /etc/redhat-release ]; then
+        releasefile='/etc/redhat-release'
+    elif [ -e /etc/centos-release ]; then
+        releasefile='/etc/centos-release'
+    else
+        #Cannot detect os version so abandon the check as unknown
+        print_output $UNKNOWN "Could not locate os release files (/etc/redhat-release)"
+        exit 0
+    fi
+    RELEASE=`sed 's/[^0-9]*\([0-9]\).*/\1/g' $releasefile`
+    if [ $RELEASE -lt 5 ]; then
+        #If OS is less than version 5 then we wont support it. future versions we will assume its compatible with centos7 update commands
+        print_output $UNKNOWN "This OS is not supported"
+        exit 0
+    fi
+}
+
+
+check_yum_security () 
+{
+    #check the yum security plugin is installed and working, otherwise whats the point.
+    $YUM $OPTIONS --security version &> /dev/null
+    if [[ $? -gt 0 ]]; then
+        #looks like its not installed, so we either install it and carry on or we issue an error and let a human sort it out.
+        if [ $INSTALL_SECURITY_PLUGIN ]; then 
+            #install plugin and carry on.
+            [ $RELEASE -eq 5 ] && package="yum-security.noarch"
+            [ $RELEASE -ge 6 ] && package="yum-plugin-security"
+            $YUM $OPTIONS -y install $package &> /dev/null
+            if [[ $? -gt 0 ]]; then
+                #oops something went wrong, alert
+                print_output $WARNING "Could not install Yum security plugin!"
+                exit 0
+            fi
+        else
+            #we dont install anything so lets alert someone.
+            print_output $WARNING "Yum security plugin is not installed!"
+            exit 0
+        fi
+    fi
+}
+
+
+check_yum_updates () 
+{
+    #check system for importany updates and alert appropiately
+    #We will only support CentOS/RHEl 5+
+    if [ $RELEASE -eq 5 ]; then
+        #Version 5 is limited on usage, so output will be simplified. This means we can only communicate the # of missing security updates.
+        IFS=$'\n'
+        for i in `$YUM $OPTIONS $BLACKLIST --security check-update`; do
+            if  [[ $i =~ ", for security" ]]; then
+                if  [[ $i =~ "No packages needed" ]]; then
+                    alert=$OK
+                    print_output $alert $i
+                    exit 0
+                else
+                    #Critical updates identified so add to alert message and activate the alert.
+                    alert=$ALERTLEVEL
+                    print_output $alert "`echo $i | sed 's/[^0-9]*\([0-9]*\).*/\1/g'` Security updates needed"
+                    exit 0
+                fi
+            fi
+        done
+
+    elif [ $RELEASE -gt 5 ]; then
+        #Version 6 upwards
+        #1473 New Package notice(s)
+        # 643 Security notice(s)
+        #     209 ? Security notice(s)
+        #      37 Critical Security notice(s)
+        #     147 Important Security notice(s)
+        #      37 Low Security notice(s)
+        #     213 Moderate Security notice(s)
+        #2839 Bugfix notice(s)
+        #1018 Enhancement notice(s)
+
+        #Version 5
+        #No packages needed, for security, 0 available
+        #Needed 3 of 5 packages, for security
+        #Needed 69 of 187 packages, for security
+        criticalupdates=-1
+        importantupdates=-1
+        moderateupdates=-1
+        lowupdates=-1
+        statustext=""
+        needsreboot=""
+        alert=$OK
+        OLDIFS=$IFS
+        IFS=$'\n'
+        for i in `$YUM $OPTIONS $BLACKLIST updateinfo summary updates`; do
+            if  [[ $i =~ "Critical Security notice" ]]; then
+                criticalupdates=`echo $i | sed 's/[^0-9]//g'`
+                continue
+            fi
+            if  [[ $i =~ "Important Security notice" ]]; then
+                importantupdates=`echo $i | sed 's/[^0-9]//g'`
+                continue
+            fi
+            if  [[ $i =~ "Moderate Security notice" ]]; then
+                moderateupdates=`echo $i | sed 's/[^0-9]//g'`
+                continue
+            fi
+            if  [[ $i =~ "Low Security notice" ]]; then
+                lowupdates=`echo $i | sed 's/[^0-9]//g'`
+                continue
+            fi
+        done
+        if [ $criticalupdates -gt $CRITICALLEVEL ]; then
+            #Critical updates detected so add to alert message and activate the alert.
+            alert=$ALERTLEVEL
+            statustext="$statustext $criticalupdates Critical,"
+        fi
+        if [ $importantupdates -gt $IMPORTANTLEVEL ]; then
+            #Important updates detected so add to alert message and activate the alert.
+            alert=$ALERTLEVEL
+            statustext="$statustext $importantupdates Important,"
+        fi
+        if [ $moderateupdates -gt 0 ]; then
+            #Moderate updates detected so add to alert message and not alert.
+            statustext="$statustext $moderateupdates Moderate,"
+        fi
+        if [ $lowupdates -gt 0 ]; then
+            #Low updates detected so add to alert message and not alert.
+            statustext="$statustext $lowupdates Low"
+        fi
+
+        #Gather current running kernel version and then compare with the latest installed. If older then we need a reboot
+        local current=`uname -r`
+        local latest=`rpm -qa -last kernel | head -1 | awk '{print $1}'`
+        if [[ ! $latest =~ $current ]]; then
+            needsreboot="Reboot is pending!"
+            alert=$ALERTLEVEL
+        fi
+    
+        #closing description string.
+        if [[ $statustext == "" ]]; then 
+            statustext="no security updates required. $needsreboot"
+        else
+            statustext="$statustext updates needed. $needsreboot"
+        fi
+
+        #Create the alert message for omd
+        print_output $alert $statustext
+
+        #Should we clean the yum cache afterwards?
+        if [ $YUMCLEAN -ge 1 ]; then 
+            $YUM $OPTIONS clean all &> /dev/null
+        fi
+        IFS=$OLDIFS
+    else
+        #Either too old or something is wrong
+        print_output $WARNING "OS not supported or error with release version."
+        exit $WARNING
+    fi
+}
+
+function allowed_execution_time
+{
+    #Function to setup a trap to kill this process if it runs for too long.
+    ( 
+     sleep $1
+     [ `kill -0 $$ &> /dev/null; echo $?` -eq 0 ] && kill -ALRM $$
+    ) &
+}
+
+function timeout_handler
+{
+    #timeout function
+    print_output $WARNING "Checked took too long, is yum working correctly?"
+    exit $WARNING
+}
+
+print_output () 
+{
+    #print out service check command thats is compliant with check_mk
+    status=$1
+    description=$2
+    if   [[ $status -eq 0 ]]; then 
+        statustext="OK -"
+    elif [[ $status -eq 1 ]]; then 
+        statustext="WARN -"
+    elif [[ $status -eq 2 ]]; then 
+        statustext="CRIT -"
+    else
+        statustext="UNKNOWN -"
+    fi
+    description="$statustext $description"
+    echo "<<<local>>>"
+    echo "$status $CHECKNAME $PERFDATA $description"
+    trap '' SIGALRM
+}
+
+### MAIN ###
+#dont bother with check if not root...
+if [ ! $USER == root ]; then
+    #exit silently to protect check_mk from incompatible noise.
+    exit 1
+fi
+
+#if we cant find yum then give up.
+if [ ! -e $YUM ]; then
+    #exit silently to protect check_mk from incompatible noise.
+    exit 1
+fi
+
+#Load variables from config file to allow overides to the global variables at the top.
+[ -e /etc/check_mk/check_mk_yum.conf ] && . /etc/check_mk/check_mk_yum.conf
+
+#Setup timeout trap to prevent it running forever. This could happen if yum is stuck.
+trap timeout_handler SIGALRM
+allowed_execution_time $TIMEOUTVAL
+
+#determine which os version this is because older versions are limited on what can be done + commands are different.
+get_version
+
+#is security plugin installed? if not, should we install?
+check_yum_security
+
+#run check
+check_yum_updates
+
+exit 0

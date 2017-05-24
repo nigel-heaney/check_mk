@@ -1,0 +1,250 @@
+#!/bin/bash
+#  check_mk_apt: Local plugin for check_mk_agent and will parse apt for updates and alert when critical/High/Important
+#                patches patches are missing. This check is exclusively tested on ubuntu 14 atm.
+#
+#                Due to the slow nature of apt checks and updating caches we should set this up to not run every 2 minutes!
+#
+#   Version      Author          Date        Description
+#     0.1        Nigel Heaney    08-08-2016  Initial version
+
+APT=/usr/bin/apt-get
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+ALERTLEVEL=$WARNING                                     #Set this to whatever we want when a critical/important update are detected.
+HIGHLEVEL=9                                             #how many important updates are missing before it triggers an alert. 
+CRITICALLEVEL=0                                         #How many critical updates before it will alert
+CHECKNAME="APT"
+SECURITY_NAME='trusty-security'
+PERFDATA="-"                                            #We wont be maintaining perfdata...for now
+BLACKLIST=""
+OPTIONS=''			                                    #Setup any options here.
+RELEASE=0
+TIMEOUTVAL=600
+TEMP_PACKAGES="/dev/shm/_tmp1_check_mk_apt.$$"
+TEMP_LIST="/dev/shm/_tmp2_check_mk_apt.$$"
+TEMP_FILE="/dev/shm/_tmp3_check_mk_apt.$$"
+
+
+get_version () 
+{
+    #query release files to obtain OS release, rhel5 functions differently and requires different command to be executed.
+    if [ -e /etc/os-release ]; then
+        releasefile='/etc/os-release'
+    elif [ -e /etc/lsb-release ]; then
+        releasefile='/etc/lsb-release'
+    else
+        #Cannot detect os version so abandon the check as unknown
+        print_output $UNKNOWN "Could not locate os release files (/etc/os-release)"
+        exit 0
+    fi
+    RELEASE=`egrep "VERSION_ID|DISTRIB_RELEASE" $releasefile | sed 's/[^0-9\.]*\([0-9]*\).*/\1/g'`
+    if [ $RELEASE -lt 14 ]; then
+        #If OS is less than version 14 then we wont support it. 
+        print_output $UNKNOWN "This OS is not supported"
+        exit 0
+    elif [ $RELEASE -eq 14 ]; then
+        SECURITY_NAME='trusty-security'
+    fi
+}
+
+
+check_apt_update () 
+{
+    #Get apt-get to update its local indexes to determine which upgrades are required
+    $APT $OPTIONS -qqy update &> $TEMP_FILE 
+    egrep -q 'Err|Failed'  $TEMP_FILE
+    if [[ $? -eq 0 ]]; then
+        #looks like apt update had an issue for some reason, cannot continue with out of date indexes so abort.
+        print_output $WARNING "apt-get unable to perform update on indexes."
+        exit 0
+    fi
+}
+
+check_apt_upgrade () 
+{
+    #check system for importany updates and alert appropiately
+    criticalupdates=0
+    highupdates=0
+    mediumupdates=0
+    lowupdates=0
+    unknownupdates=0
+    statustext=""
+    needsreboot=""
+    alert=$OK
+    OLDIFS=$IFS
+    IFS=$'\n'
+    #generate a list of updates from $SECURITY_NAME (e.g trusty-security) - low,medium,high,critical
+    $APT $OPTIONS -s -q -t $SECURITY_NAME upgrade > $TEMP_PACKAGES 2>/dev/null
+
+    #now cleanup output to only list what we want
+    egrep '^Inst' $TEMP_PACKAGES | sort | uniq > $TEMP_LIST 2>/dev/null
+    
+    for pkg in `cat $TEMP_LIST`; do
+        pname=`echo $pkg | cut -d' ' -f 2`
+        #Grab the current package version and strip away brackets and potentially leading number followed by colon
+        pversion=`echo $pkg | cut -d' ' -f 3 | tr -d '[]()'`
+        pversion=`echo $pversion | sed 's/^.*://g'`
+
+        $APT $OPTIONS -q changelog $pname 2>&1 | grep 'urgency=' > $TEMP_FILE 2> /dev/null
+
+        #check package list for errors
+        if [[ $? -gt 0 ]]; then
+            egrep -q '403  Forbidden' $TEMP_FILE &>/dev/null
+            if [[ $? -eq 0 ]]; then
+                #Check for 403s - access denied to proxy :)
+                print_output $WARNING "problem accessing proxy looking up changelog(s), please check"
+                exit 0
+            fi
+            egrep -q '404  Not Found' $TEMP_FILE &>/dev/null
+            if [[ $? -eq 0 ]]; then
+                unknownupdates=$((unknownupdates + 1))
+                continue
+            fi
+        fi
+
+        #Iterate over the changelog to capture all missing updates.  There are weird naming inconsistences in the changelogs and package names, hence the need to tweak package names.
+        for v in `cat $TEMP_FILE`; do
+            #Grab the category of update version
+            patch_category=`echo $v | awk '/urgency=/ {gsub(/^.*urgency=/, ""); print}' 2>/dev/null`
+            #Grab the latest or current package version in changelog and strip away brackets and potentially leading number followed by colon
+            patch_version=`echo $v | cut -d' ' -f 2 | tr -d '[]()' 2>/dev/null`
+            patch_version=`echo $patch_version | sed 's/^.*://g'`
+            if [[ ! $pversion =~ $patch_version ]]; then
+                if  [[ $patch_category =~ "critical" ]]; then
+                  criticalupdates=$((criticalupdates + 1))
+                  continue
+                fi
+                if  [[ $patch_category =~ "high" ]]; then
+                  highupdates=$((highupdates + 1))
+                  continue
+                fi
+                if  [[ $patch_category =~ "medium" ]]; then
+                  mediumupdates=$((mediumupdates + 1))
+                  continue
+                fi
+                if  [[ $patch_category =~ "low" ]]; then
+                  lowupdates=$((lowupdates + 1))
+                  continue
+                fi
+            else
+                #found matching version so dont check this history anylonger.
+                #echo "MATCHED --> pkg=$pname $pversion | C=$criticalupdates | H=$highupdates | M=$mediumupdates | U=$lowupdates"
+                break
+            fi
+        done
+    done
+    
+    #cleanup
+    rm -f $TEMP_PACKAGES
+    rm -f $TEMP_LIST
+    rm -f $TEMP_FILE
+    
+    if [ $criticalupdates -gt $CRITICALLEVEL ]; then
+      #Critical updates detected so add to alert message and activate the alert.
+      alert=$ALERTLEVEL
+      statustext="$statustext $criticalupdates Critical,"
+    fi
+    if [ $highupdates -gt $HIGHLEVEL ]; then
+      #Important updates detected so add to alert message and activate the alert.
+      alert=$ALERTLEVEL
+      statustext="$statustext $highupdates High,"
+    fi
+    if [ $mediumupdates -gt 0 ]; then
+      #Medium updates detected so add to alert message and not alert.
+      statustext="$statustext $mediumupdates Medium,"
+    fi
+    if [ $lowupdates -gt 0 ]; then
+      #Low updates detected so add to alert message and not alert.
+      statustext="$statustext $lowupdates Low,"
+    fi
+    if [ $unknownupdates -gt 0 ]; then
+      #Unknown updates detected so add to alert message and not alert.
+      statustext="$statustext $unknownupdates Unknown"
+    fi
+
+    #Check if system is waiting for a reboot
+    if [ -e "/var/run/reboot-required" ]; then
+        needsreboot="Reboot is pending!"
+        alert=$ALERTLEVEL
+    fi
+    
+    #closing description string.
+    if [[ $statustext == "" ]]; then 
+        statustext="no security updates required. $needsreboot"
+    else
+        statustext="$statustext updates needed. $needsreboot"
+    fi
+        
+    #Create the alert message for omd
+    print_output $alert $statustext
+
+}
+
+function allowed_execution_time
+{
+    #Function to setup a trap to kill this process if it runs for too long.
+    ( 
+     sleep $1
+     [ `kill -0 $$ &> /dev/null; echo $?` -eq 0 ] && kill -ALRM $$
+    ) &
+}
+
+function timeout_handler
+{
+    #timeout function
+    print_output $WARNING "Checked took too long, is APT working correctly?"
+    exit $WARNING
+}
+
+print_output () 
+{
+    #print out service check command thats is compliant with check_mk
+    status=$1
+    description=$2
+    if   [[ $status -eq 0 ]]; then 
+        statustext="OK -"
+    elif [[ $status -eq 1 ]]; then 
+        statustext="WARN -"
+    elif [[ $status -eq 2 ]]; then 
+        statustext="CRIT -"
+    else
+        statustext="UNKNOWN -"
+    fi
+    description="$statustext $description" 
+    echo "<<<local>>>"
+    echo "$status $CHECKNAME $PERFDATA $description"
+    trap '' SIGALRM
+}
+
+### MAIN ###
+#dont bother with check if not root...
+if [ ! $USER == root ]; then
+    #exit silently to protect check_mk from incompatible noise.
+    exit 1
+fi
+
+#if we cant find APT then give up.
+if [ ! -e $APT ]; then
+    #exit silently to protect check_mk from incompatible noise.
+    exit 1
+fi
+
+#Load variables from config file to allow overides to the global variables at the top.
+[ -e /etc/check_mk/check_mk_apt.conf ] && . /etc/check_mk/check_mk_apt.conf
+
+#Setup timeout trap to prevent it running forever. This could happen if APT is stuck.
+trap timeout_handler SIGALRM
+allowed_execution_time $TIMEOUTVAL
+
+#determine which os version this is because older versions are limited on what can be done + commands are different.
+get_version
+
+#pull down fresh indexes for check
+check_apt_update
+
+#run check
+check_apt_upgrade
+
+exit 0
