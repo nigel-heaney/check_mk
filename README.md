@@ -1,6 +1,12 @@
 # check_mk
 My collection of check_mk plugins
 
+## check_mk_dnsdist.py
+This plugin will connect to dnsdist via its api interface and monitor stats and status of various components of dnsdist. 
+This includes pool status (up/down/partial), qps, latency, queries performed, and api status. This has been written and 
+tested as a local plugin only.
+
+
 ## check_mk_docker.py
 This will allow you to monitor several aspects of docker and optionally individual containers which can track cpu,memory,disk and if a particular container is up or not.
 
@@ -23,8 +29,8 @@ This is designed to be run as a local check and is relatively slow so to protect
 ## check_mk_yum
 This check is designed to utilise the yum security plugin and will report back on missing patches based on security or risk tot he server. Will trigger an alert after 10 critical updates missing.  This has been tested on Redhat 5,6,7 and Centos 5,6,7.  Everything else is not supported.
 
-Now Centos do no not support errata nor do they publish errata so this will not with Centos out of the box.  This requires that you are using something like Spacewalk with errata published or use another method which I setup so I could publish errata to local repos. See centos-errata repo for this.
+Centos DO NOT support errata nor do they publish errata so this will not work with CentOS out of the box.  This requires that you are using something like Spacewalk with errata published or use another method which I setup so I could publish errata to local repos. See centos-errata repo for this.
 
-This is designed to be run as a local check and is relatively slow so to protect check_mk_agent from taking too long, set this up as a cached check say every 24 hours.
+This is designed to be run as a local check and is relatively slow so to protect check_mk_agent from taking too long, set this up as a cached check and updated every 24 hours.
 
 
